@@ -360,6 +360,145 @@ async def list_tools() -> List[Tool]:
                 "properties": {},
                 "required": []
             }
+        ),
+
+        # Thread Tools
+        Tool(
+            name="create_thread",
+            description="Create a new thread in a channel. Can be attached to a message or standalone.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel to create thread in"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Thread name"
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "Optional message ID to attach thread to"
+                    },
+                    "auto_archive_duration": {
+                        "type": "number",
+                        "description": "Minutes before auto-archive (60, 1440, 4320, or 10080)",
+                        "enum": [60, 1440, 4320, 10080]
+                    }
+                },
+                "required": ["channel_id", "name"]
+            }
+        ),
+        Tool(
+            name="list_threads",
+            description="List active threads in a channel",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel to list threads from"
+                    }
+                },
+                "required": ["channel_id"]
+            }
+        ),
+        Tool(
+            name="send_thread_message",
+            description="Send a message to a thread",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread ID to send message to"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Message content"
+                    }
+                },
+                "required": ["thread_id", "content"]
+            }
+        ),
+        Tool(
+            name="archive_thread",
+            description="Archive or unarchive a thread",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread ID"
+                    },
+                    "archived": {
+                        "type": "boolean",
+                        "description": "True to archive, false to unarchive"
+                    }
+                },
+                "required": ["thread_id", "archived"]
+            }
+        ),
+        Tool(
+            name="edit_thread",
+            description="Edit a thread's name or other properties",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread ID"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New thread name"
+                    }
+                },
+                "required": ["thread_id"]
+            }
+        ),
+
+        # Forum Channel Tools
+        Tool(
+            name="create_forum_post",
+            description="Create a new post in a forum channel",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Forum channel ID"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Post title"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Initial message content"
+                    }
+                },
+                "required": ["channel_id", "name", "content"]
+            }
+        ),
+        Tool(
+            name="edit_channel_name",
+            description="Rename a channel or thread",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel or thread ID"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New name"
+                    }
+                },
+                "required": ["channel_id", "name"]
+            }
         )
     ]
 
@@ -605,6 +744,87 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
             type="text",
             text=f"Available Servers ({len(servers)}):\n" + 
                  "\n".join(f"{s['name']} (ID: {s['id']}, Members: {s['member_count']})" for s in servers)
+        )]
+
+    # Thread Tools
+    elif name == "create_thread":
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        if "message_id" in arguments:
+            message = await channel.fetch_message(int(arguments["message_id"]))
+            thread = await message.create_thread(
+                name=arguments["name"],
+                auto_archive_duration=arguments.get("auto_archive_duration", 1440)
+            )
+        else:
+            thread = await channel.create_thread(
+                name=arguments["name"],
+                auto_archive_duration=arguments.get("auto_archive_duration", 1440),
+                type=discord.ChannelType.public_thread
+            )
+        return [TextContent(
+            type="text",
+            text=f"Created thread '{thread.name}' (ID: {thread.id})"
+        )]
+
+    elif name == "list_threads":
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        threads = channel.threads
+        if not threads:
+            return [TextContent(type="text", text="No active threads in this channel.")]
+        thread_list = []
+        for t in threads:
+            thread_list.append(f"#{t.name} (ID: {t.id}, messages: {t.message_count}, archived: {t.archived})")
+        return [TextContent(
+            type="text",
+            text=f"Active threads ({len(threads)}):\n" + "\n".join(thread_list)
+        )]
+
+    elif name == "send_thread_message":
+        thread = await discord_client.fetch_channel(int(arguments["thread_id"]))
+        message = await thread.send(arguments["content"])
+        return [TextContent(
+            type="text",
+            text=f"Message sent to thread. Message ID: {message.id}"
+        )]
+
+    elif name == "archive_thread":
+        thread = await discord_client.fetch_channel(int(arguments["thread_id"]))
+        await thread.edit(archived=arguments["archived"])
+        status = "archived" if arguments["archived"] else "unarchived"
+        return [TextContent(
+            type="text",
+            text=f"Thread '{thread.name}' {status}."
+        )]
+
+    elif name == "edit_thread":
+        thread = await discord_client.fetch_channel(int(arguments["thread_id"]))
+        kwargs = {}
+        if "name" in arguments:
+            kwargs["name"] = arguments["name"]
+        await thread.edit(**kwargs)
+        return [TextContent(
+            type="text",
+            text=f"Thread updated: {thread.name}"
+        )]
+
+    elif name == "create_forum_post":
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        thread_with_message = await channel.create_thread(
+            name=arguments["name"],
+            content=arguments["content"]
+        )
+        thread = thread_with_message[0] if isinstance(thread_with_message, tuple) else thread_with_message
+        return [TextContent(
+            type="text",
+            text=f"Created forum post '{arguments['name']}' (Thread ID: {thread.id})"
+        )]
+
+    elif name == "edit_channel_name":
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        await channel.edit(name=arguments["name"])
+        return [TextContent(
+            type="text",
+            text=f"Channel renamed to '{arguments['name']}'"
         )]
 
     raise ValueError(f"Unknown tool: {name}")
