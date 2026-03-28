@@ -768,15 +768,25 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
 
     elif name == "list_threads":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
-        threads = channel.threads
-        if not threads:
-            return [TextContent(type="text", text="No active threads in this channel.")]
+        # Active threads
+        active = list(channel.threads)
+        # Archived threads (forum posts that are "done" or old)
+        archived = []
+        try:
+            async for t in channel.archived_threads(limit=50):
+                archived.append(t)
+        except Exception:
+            pass
+        all_threads = active + archived
+        if not all_threads:
+            return [TextContent(type="text", text="No threads in this channel.")]
         thread_list = []
-        for t in threads:
-            thread_list.append(f"#{t.name} (ID: {t.id}, messages: {t.message_count}, archived: {t.archived})")
+        for t in all_threads:
+            status = "archived" if t.archived else "active"
+            thread_list.append(f"[{status}] {t.name} (ID: {t.id}, messages: {t.message_count})")
         return [TextContent(
             type="text",
-            text=f"Active threads ({len(threads)}):\n" + "\n".join(thread_list)
+            text=f"Threads ({len(active)} active, {len(archived)} archived):\n" + "\n".join(thread_list)
         )]
 
     elif name == "send_thread_message":
