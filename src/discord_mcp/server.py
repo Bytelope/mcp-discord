@@ -392,13 +392,17 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="list_threads",
-            description="List active threads in a channel",
+            description="List threads in a channel. Only shows active threads by default.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "channel_id": {
                         "type": "string",
                         "description": "Channel to list threads from"
+                    },
+                    "include_archived": {
+                        "type": "boolean",
+                        "description": "Include archived threads (default: false)"
                     }
                 },
                 "required": ["channel_id"]
@@ -518,7 +522,22 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     elif name == "read_messages":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
         limit = min(int(arguments.get("limit", 10)), 100)
-        fetch_users = arguments.get("fetch_reaction_users", False)  # Only fetch users if explicitly requested
+        fetch_users = arguments.get("fetch_reaction_users", False)
+
+        # Forum channels don't have message history — list their threads instead
+        if isinstance(channel, discord.ForumChannel):
+            threads = list(channel.threads)
+            if not threads:
+                return [TextContent(type="text", text="No active threads in this forum channel. Use list_threads to see archived threads.")]
+            thread_list = []
+            for t in threads:
+                thread_list.append(f"#{t.name} (ID: {t.id}, messages: {t.message_count})")
+            return [TextContent(
+                type="text",
+                text=f"Forum channel has {len(threads)} active threads:\n" + "\n".join(thread_list) +
+                     "\n\nUse read_messages with a thread ID to read messages within a thread."
+            )]
+
         messages = []
         async for message in channel.history(limit=limit):
             reaction_data = []
@@ -528,27 +547,39 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                     "emoji": emoji_str,
                     "count": reaction.count
                 }
-                logger.error(f"Emoji: {emoji_str}")
                 reaction_data.append(reaction_info)
+            attachment_data = []
+            for att in message.attachments:
+                attachment_data.append({
+                    "filename": att.filename,
+                    "url": att.url,
+                    "content_type": att.content_type,
+                    "size": att.size
+                })
             messages.append({
                 "id": str(message.id),
                 "author": str(message.author),
                 "content": message.content,
                 "timestamp": message.created_at.isoformat(),
-                "reactions": reaction_data  # Add reactions to message dict
+                "reactions": reaction_data,
+                "attachments": attachment_data
             })
         # Helper function to format reactions
         def format_reaction(r):
             return f"{r['emoji']}({r['count']})"
             
+        def format_message(m):
+            lines = [f"{m['author']} ({m['timestamp']}): {m['content']}"]
+            if m['attachments']:
+                att_strs = [f"{a['filename']} ({a['content_type']}, {a['url']})" for a in m['attachments']]
+                lines.append(f"Attachments: {', '.join(att_strs)}")
+            lines.append(f"Reactions: {', '.join([format_reaction(r) for r in m['reactions']]) if m['reactions'] else 'No reactions'}")
+            return "\n".join(lines)
+
         return [TextContent(
             type="text",
-            text=f"Retrieved {len(messages)} messages:\n\n" + 
-                 "\n".join([
-                     f"{m['author']} ({m['timestamp']}): {m['content']}\n" +
-                     f"Reactions: {', '.join([format_reaction(r) for r in m['reactions']]) if m['reactions'] else 'No reactions'}"
-                     for m in messages
-                 ])
+            text=f"Retrieved {len(messages)} messages:\n\n" +
+                 "\n".join([format_message(m) for m in messages])
         )]
 
     elif name == "get_user_info":
@@ -768,25 +799,26 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
 
     elif name == "list_threads":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        include_archived = arguments.get("include_archived", False)
         # Active threads
         active = list(channel.threads)
-        # Archived threads (forum posts that are "done" or old)
         archived = []
-        try:
-            async for t in channel.archived_threads(limit=50):
-                archived.append(t)
-        except Exception:
-            pass
+        if include_archived:
+            try:
+                async for t in channel.archived_threads(limit=50):
+                    archived.append(t)
+            except Exception:
+                pass
         all_threads = active + archived
         if not all_threads:
-            return [TextContent(type="text", text="No threads in this channel.")]
+            return [TextContent(type="text", text="No active threads in this channel.")]
         thread_list = []
         for t in all_threads:
-            status = "archived" if t.archived else "active"
-            thread_list.append(f"[{status}] {t.name} (ID: {t.id}, messages: {t.message_count})")
+            prefix = "[archived] " if t.archived else ""
+            thread_list.append(f"{prefix}#{t.name} (ID: {t.id}, messages: {t.message_count})")
         return [TextContent(
             type="text",
-            text=f"Threads ({len(active)} active, {len(archived)} archived):\n" + "\n".join(thread_list)
+            text=f"Threads ({len(active)} active{f', {len(archived)} archived' if archived else ''}):\n" + "\n".join(thread_list)
         )]
 
     elif name == "send_thread_message":
