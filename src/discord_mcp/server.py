@@ -316,6 +316,46 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="edit_message",
+            description="Edit a message sent by this bot",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel containing the message"
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "Message ID to edit"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "New message content"
+                    }
+                },
+                "required": ["channel_id", "message_id", "content"]
+            }
+        ),
+        Tool(
+            name="delete_message",
+            description="Delete a specific message (bot's own or with Manage Messages permission)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel containing the message"
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "Message ID to delete"
+                    }
+                },
+                "required": ["channel_id", "message_id"]
+            }
+        ),
+        Tool(
             name="read_messages",
             description="Read recent messages from a channel",
             inputSchema={
@@ -562,6 +602,24 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         return [TextContent(
             type="text",
             text=f"Message sent successfully. Message ID: {message.id}"
+        )]
+
+    elif name == "edit_message":
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        message = await channel.fetch_message(int(arguments["message_id"]))
+        await message.edit(content=arguments["content"])
+        return [TextContent(
+            type="text",
+            text=f"Message {arguments['message_id']} edited successfully."
+        )]
+
+    elif name == "delete_message":
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        message = await channel.fetch_message(int(arguments["message_id"]))
+        await message.delete()
+        return [TextContent(
+            type="text",
+            text=f"Message {arguments['message_id']} deleted."
         )]
 
     elif name == "read_messages":
