@@ -1,10 +1,12 @@
 import os
 import sys
+import io
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, List
+from typing import Any, List, Optional
 from functools import wraps
+from urllib.parse import urlparse
 import discord
 from discord.ext import commands
 from mcp.server import Server
@@ -54,6 +56,21 @@ def require_discord_client(func):
             raise RuntimeError("Discord client not ready")
         return await func(*args, **kwargs)
     return wrapper
+
+async def _download_image(url: str) -> Optional[discord.File]:
+    """Download an image from URL and return as discord.File."""
+    try:
+        import httpx
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "image/png")
+            ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}.get(content_type, ".png")
+            filename = f"image{ext}"
+            return discord.File(io.BytesIO(resp.content), filename=filename)
+    except Exception as e:
+        logger.error(f"Failed to download image from {url}: {e}")
+        return None
 
 @app.list_tools()
 async def list_tools() -> List[Tool]:
@@ -274,7 +291,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="send_message",
-            description="Send a message to a specific channel",
+            description="Send a message to a specific channel. Supports image attachments and replies.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -285,6 +302,14 @@ async def list_tools() -> List[Tool]:
                     "content": {
                         "type": "string",
                         "description": "Message content"
+                    },
+                    "image_url": {
+                        "type": "string",
+                        "description": "URL of image to attach (downloaded and sent as file)"
+                    },
+                    "reply_to_message_id": {
+                        "type": "string",
+                        "description": "Message ID to reply to (creates a threaded reply)"
                     }
                 },
                 "required": ["channel_id", "content"]
@@ -410,7 +435,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="send_thread_message",
-            description="Send a message to a thread",
+            description="Send a message to a thread. Supports image attachments and replies.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -421,6 +446,14 @@ async def list_tools() -> List[Tool]:
                     "content": {
                         "type": "string",
                         "description": "Message content"
+                    },
+                    "image_url": {
+                        "type": "string",
+                        "description": "URL of image to attach (downloaded and sent as file)"
+                    },
+                    "reply_to_message_id": {
+                        "type": "string",
+                        "description": "Message ID to reply to within the thread"
                     }
                 },
                 "required": ["thread_id", "content"]
@@ -466,7 +499,7 @@ async def list_tools() -> List[Tool]:
         # Forum Channel Tools
         Tool(
             name="create_forum_post",
-            description="Create a new post in a forum channel",
+            description="Create a new post in a forum channel. Supports image attachment.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -481,6 +514,10 @@ async def list_tools() -> List[Tool]:
                     "content": {
                         "type": "string",
                         "description": "Initial message content"
+                    },
+                    "image_url": {
+                        "type": "string",
+                        "description": "URL of image to attach to the first message"
                     }
                 },
                 "required": ["channel_id", "name", "content"]
@@ -513,7 +550,15 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     
     if name == "send_message":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
-        message = await channel.send(arguments["content"])
+        kwargs = {"content": arguments["content"]}
+        if arguments.get("image_url"):
+            file = await _download_image(arguments["image_url"])
+            if file:
+                kwargs["file"] = file
+        if arguments.get("reply_to_message_id"):
+            ref_msg = await channel.fetch_message(int(arguments["reply_to_message_id"]))
+            kwargs["reference"] = ref_msg
+        message = await channel.send(**kwargs)
         return [TextContent(
             type="text",
             text=f"Message sent successfully. Message ID: {message.id}"
@@ -823,7 +868,15 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
 
     elif name == "send_thread_message":
         thread = await discord_client.fetch_channel(int(arguments["thread_id"]))
-        message = await thread.send(arguments["content"])
+        kwargs = {"content": arguments["content"]}
+        if arguments.get("image_url"):
+            file = await _download_image(arguments["image_url"])
+            if file:
+                kwargs["file"] = file
+        if arguments.get("reply_to_message_id"):
+            ref_msg = await thread.fetch_message(int(arguments["reply_to_message_id"]))
+            kwargs["reference"] = ref_msg
+        message = await thread.send(**kwargs)
         return [TextContent(
             type="text",
             text=f"Message sent to thread. Message ID: {message.id}"
@@ -851,10 +904,12 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
 
     elif name == "create_forum_post":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
-        thread_with_message = await channel.create_thread(
-            name=arguments["name"],
-            content=arguments["content"]
-        )
+        kwargs = {"name": arguments["name"], "content": arguments["content"]}
+        if arguments.get("image_url"):
+            file = await _download_image(arguments["image_url"])
+            if file:
+                kwargs["file"] = file
+        thread_with_message = await channel.create_thread(**kwargs)
         thread = thread_with_message[0] if isinstance(thread_with_message, tuple) else thread_with_message
         return [TextContent(
             type="text",
