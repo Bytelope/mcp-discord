@@ -72,6 +72,17 @@ async def _download_image(url: str) -> Optional[discord.File]:
         logger.error(f"Failed to download image from {url}: {e}")
         return None
 
+def _resolve_channel_ids(arguments: dict) -> list[str]:
+    ids = arguments.get("channel_ids")
+    if ids:
+        if not isinstance(ids, list) or not ids:
+            raise ValueError("channel_ids must be a non-empty list of strings")
+        return [str(c) for c in ids]
+    single = arguments.get("channel_id")
+    if not single:
+        raise ValueError("Provide either channel_id or channel_ids")
+    return [str(single)]
+
 @app.list_tools()
 async def list_tools() -> List[Tool]:
     """List available Discord tools."""
@@ -357,22 +368,26 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="read_messages",
-            description="Read recent messages from a channel",
+            description="Read recent messages from one or more channels. Pass either channel_id (single) or channel_ids (batch) — batched calls are fetched concurrently.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "channel_id": {
                         "type": "string",
-                        "description": "Discord channel ID"
+                        "description": "Discord channel ID (single-channel mode)"
+                    },
+                    "channel_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of Discord channel IDs (batch mode). Provide instead of channel_id to fetch many at once."
                     },
                     "limit": {
                         "type": "number",
-                        "description": "Number of messages to fetch (max 100)",
+                        "description": "Number of messages to fetch per channel (max 100)",
                         "minimum": 1,
                         "maximum": 100
                     }
-                },
-                "required": ["channel_id"]
+                }
             }
         ),
         Tool(
@@ -457,20 +472,24 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="list_threads",
-            description="List threads in a channel. Only shows active threads by default.",
+            description="List threads in one or more channels. Pass either channel_id (single) or channel_ids (batch) — batched calls are fetched concurrently.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "channel_id": {
                         "type": "string",
-                        "description": "Channel to list threads from"
+                        "description": "Channel to list threads from (single-channel mode)"
+                    },
+                    "channel_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Channels to list threads from (batch mode). Provide instead of channel_id to query many at once."
                     },
                     "include_archived": {
                         "type": "boolean",
                         "description": "Include archived threads (default: false)"
                     }
-                },
-                "required": ["channel_id"]
+                }
             }
         ),
         Tool(
@@ -623,54 +642,12 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         )]
 
     elif name == "read_messages":
-        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        channel_ids = _resolve_channel_ids(arguments)
         limit = min(int(arguments.get("limit", 10)), 100)
-        fetch_users = arguments.get("fetch_reaction_users", False)
 
-        # Forum channels don't have message history — list their threads instead
-        if isinstance(channel, discord.ForumChannel):
-            threads = list(channel.threads)
-            if not threads:
-                return [TextContent(type="text", text="No active threads in this forum channel. Use list_threads to see archived threads.")]
-            thread_list = []
-            for t in threads:
-                thread_list.append(f"#{t.name} (ID: {t.id}, messages: {t.message_count})")
-            return [TextContent(
-                type="text",
-                text=f"Forum channel has {len(threads)} active threads:\n" + "\n".join(thread_list) +
-                     "\n\nUse read_messages with a thread ID to read messages within a thread."
-            )]
-
-        messages = []
-        async for message in channel.history(limit=limit):
-            reaction_data = []
-            for reaction in message.reactions:
-                emoji_str = str(reaction.emoji.name) if hasattr(reaction.emoji, 'name') and reaction.emoji.name else str(reaction.emoji.id) if hasattr(reaction.emoji, 'id') else str(reaction.emoji)
-                reaction_info = {
-                    "emoji": emoji_str,
-                    "count": reaction.count
-                }
-                reaction_data.append(reaction_info)
-            attachment_data = []
-            for att in message.attachments:
-                attachment_data.append({
-                    "filename": att.filename,
-                    "url": att.url,
-                    "content_type": att.content_type,
-                    "size": att.size
-                })
-            messages.append({
-                "id": str(message.id),
-                "author": str(message.author),
-                "content": message.content,
-                "timestamp": message.created_at.isoformat(),
-                "reactions": reaction_data,
-                "attachments": attachment_data
-            })
-        # Helper function to format reactions
         def format_reaction(r):
             return f"{r['emoji']}({r['count']})"
-            
+
         def format_message(m):
             lines = [f"{m['author']} ({m['timestamp']}): {m['content']}"]
             if m['attachments']:
@@ -679,11 +656,49 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
             lines.append(f"Reactions: {', '.join([format_reaction(r) for r in m['reactions']]) if m['reactions'] else 'No reactions'}")
             return "\n".join(lines)
 
-        return [TextContent(
-            type="text",
-            text=f"Retrieved {len(messages)} messages:\n\n" +
-                 "\n".join([format_message(m) for m in messages])
-        )]
+        async def fetch_one(cid: str) -> str:
+            try:
+                channel = await discord_client.fetch_channel(int(cid))
+            except Exception as e:
+                return f"Error fetching channel {cid}: {e}"
+
+            if isinstance(channel, discord.ForumChannel):
+                threads = list(channel.threads)
+                if not threads:
+                    return "No active threads in this forum channel. Use list_threads to see archived threads."
+                thread_list = [f"#{t.name} (ID: {t.id}, messages: {t.message_count})" for t in threads]
+                return (f"Forum channel has {len(threads)} active threads:\n" + "\n".join(thread_list) +
+                        "\n\nUse read_messages with a thread ID to read messages within a thread.")
+
+            messages = []
+            async for message in channel.history(limit=limit):
+                reaction_data = []
+                for reaction in message.reactions:
+                    emoji_str = str(reaction.emoji.name) if hasattr(reaction.emoji, 'name') and reaction.emoji.name else str(reaction.emoji.id) if hasattr(reaction.emoji, 'id') else str(reaction.emoji)
+                    reaction_data.append({"emoji": emoji_str, "count": reaction.count})
+                attachment_data = [{
+                    "filename": att.filename,
+                    "url": att.url,
+                    "content_type": att.content_type,
+                    "size": att.size,
+                } for att in message.attachments]
+                messages.append({
+                    "id": str(message.id),
+                    "author": str(message.author),
+                    "content": message.content,
+                    "timestamp": message.created_at.isoformat(),
+                    "reactions": reaction_data,
+                    "attachments": attachment_data,
+                })
+            return (f"Retrieved {len(messages)} messages:\n\n" +
+                    "\n".join([format_message(m) for m in messages]))
+
+        if len(channel_ids) == 1:
+            return [TextContent(type="text", text=await fetch_one(channel_ids[0]))]
+
+        results = await asyncio.gather(*[fetch_one(cid) for cid in channel_ids])
+        sections = [f"=== Channel {cid} ===\n{body}" for cid, body in zip(channel_ids, results)]
+        return [TextContent(type="text", text="\n\n".join(sections))]
 
     elif name == "get_user_info":
         user = await discord_client.fetch_user(int(arguments["user_id"]))
@@ -901,28 +916,38 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         )]
 
     elif name == "list_threads":
-        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        channel_ids = _resolve_channel_ids(arguments)
         include_archived = arguments.get("include_archived", False)
-        # Active threads
-        active = list(channel.threads)
-        archived = []
-        if include_archived:
+
+        async def list_one(cid: str) -> str:
             try:
-                async for t in channel.archived_threads(limit=50):
-                    archived.append(t)
-            except Exception:
-                pass
-        all_threads = active + archived
-        if not all_threads:
-            return [TextContent(type="text", text="No active threads in this channel.")]
-        thread_list = []
-        for t in all_threads:
-            prefix = "[archived] " if t.archived else ""
-            thread_list.append(f"{prefix}#{t.name} (ID: {t.id}, messages: {t.message_count})")
-        return [TextContent(
-            type="text",
-            text=f"Threads ({len(active)} active{f', {len(archived)} archived' if archived else ''}):\n" + "\n".join(thread_list)
-        )]
+                channel = await discord_client.fetch_channel(int(cid))
+            except Exception as e:
+                return f"Error fetching channel {cid}: {e}"
+            active = list(channel.threads)
+            archived = []
+            if include_archived:
+                try:
+                    async for t in channel.archived_threads(limit=50):
+                        archived.append(t)
+                except Exception:
+                    pass
+            all_threads = active + archived
+            if not all_threads:
+                return "No active threads in this channel."
+            thread_list = []
+            for t in all_threads:
+                prefix = "[archived] " if t.archived else ""
+                thread_list.append(f"{prefix}#{t.name} (ID: {t.id}, messages: {t.message_count})")
+            return (f"Threads ({len(active)} active"
+                    f"{f', {len(archived)} archived' if archived else ''}):\n" + "\n".join(thread_list))
+
+        if len(channel_ids) == 1:
+            return [TextContent(type="text", text=await list_one(channel_ids[0]))]
+
+        results = await asyncio.gather(*[list_one(cid) for cid in channel_ids])
+        sections = [f"=== Channel {cid} ===\n{body}" for cid, body in zip(channel_ids, results)]
+        return [TextContent(type="text", text="\n\n".join(sections))]
 
     elif name == "send_thread_message":
         thread = await discord_client.fetch_channel(int(arguments["thread_id"]))
