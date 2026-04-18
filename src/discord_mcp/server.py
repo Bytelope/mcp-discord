@@ -52,6 +52,15 @@ async def on_ready():
 def require_discord_client(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
+        # The Discord gateway finishes handshaking asynchronously in the
+        # background. If the first MCP tool call lands before on_ready has
+        # fired, `discord_client` is still None. Short bounded wait lets
+        # the gateway catch up instead of failing the call outright.
+        if not discord_client:
+            try:
+                await asyncio.wait_for(bot.wait_until_ready(), timeout=15)
+            except asyncio.TimeoutError:
+                raise RuntimeError("Discord gateway did not become ready within 15s")
         if not discord_client:
             raise RuntimeError("Discord client not ready")
         return await func(*args, **kwargs)
