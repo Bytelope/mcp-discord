@@ -1019,25 +1019,10 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     raise ValueError(f"Unknown tool: {name}")
 
 async def main():
-    # Start Discord bot in the background, then block MCP startup until the
-    # gateway is ready. Under some MCP hosts (e.g. opencode over stdio) the
-    # event loop is monopolized by `app.run()` and the background bot task
-    # never progresses past IDENTIFY — tool calls then hit the require-ready
-    # guard. Waiting here gives the gateway a dedicated slice of the loop.
+    # Start Discord bot in the background
     asyncio.create_task(bot.start(DISCORD_TOKEN))
-    startup_timeout = float(os.getenv("DISCORD_STARTUP_TIMEOUT", "30"))
-    try:
-        await asyncio.wait_for(bot.wait_until_ready(), timeout=startup_timeout)
-        logger.info(f"Discord gateway ready as {bot.user}")
-    except asyncio.TimeoutError:
-        logger.error(
-            f"Discord gateway did not become ready within {startup_timeout}s. "
-            "Check token, intents (privileged intents must be enabled in the "
-            "Developer Portal if members/message_content intents are set), and "
-            "IDENTIFY rate limit (1000/day per bot token)."
-        )
-        # Continue anyway — tool calls will surface the error if still not ready.
-
+    
+    # Run MCP server
     async with stdio_server() as (read_stream, write_stream):
         await app.run(
             read_stream,
