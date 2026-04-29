@@ -41,3 +41,11 @@ venv.bak/
 
 # Logs
 *.log
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local notes
+Opus 4.7 improvement report.md

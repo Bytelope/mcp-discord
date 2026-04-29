@@ -13,9 +13,19 @@ requires-python = ">=3.10"
 readme = "README.md"
 license = {file = "LICENSE"}
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
 [project.urls]
 Homepage = "https://github.com/hanweg/mcp-discord"
 Repository = "https://github.com/hanweg/mcp-discord.git"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [build-system]
 requires = ["hatchling"]
