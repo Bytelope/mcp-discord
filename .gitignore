@@ -46,6 +46,7 @@ venv.bak/
 .pytest_cache/
 .coverage
 htmlcov/
+.venv/
 
 # Local notes
 Opus 4.7 improvement report.md
