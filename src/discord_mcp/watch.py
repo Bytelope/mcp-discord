@@ -105,9 +105,11 @@ class MessageWatcher:
         self.bot_user_id = uid
 
     async def handle_message(self, message: discord.Message) -> None:
+        # Only filter self-echoes — keeping cross-bot chatter visible is the
+        # whole point (Amara→Athena coordination, helper bots, etc.). The
+        # generic "any bot" filter was too aggressive and dropped legitimate
+        # notifications from other automated sources.
         if self.bot_user_id is not None and message.author.id == self.bot_user_id:
-            return
-        if getattr(message.author, "bot", False):
             return
         if str(message.channel.id) not in self.watch:
             return

@@ -154,11 +154,16 @@ class TestMessageWatcher:
         await asyncio.sleep(0.1)
         assert collector == []
 
-    async def test_filters_any_bot(self, watcher, collector):
+    async def test_does_not_filter_other_bots(self, watcher, collector):
+        # Cross-bot chatter (e.g. another agent posting) must surface — only
+        # self-echoes are dropped.
+        watcher.set_bot_user_id(999)
         await watcher.handle_message(
-            _fake_message("100", author_name="someBot", is_bot=True))
+            _fake_message("100", author_name="Amara",
+                          author_id=42, is_bot=True))
         await asyncio.sleep(0.1)
-        assert collector == []
+        assert len(collector) == 1
+        assert "@Amara" in collector[0]
 
     async def test_filters_unwatched_channel(self, watcher, collector):
         await watcher.handle_message(_fake_message("999"))
