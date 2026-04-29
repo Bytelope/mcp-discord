@@ -1,7 +1,7 @@
 # Discord MCP Server
 
 [![smithery badge](https://smithery.ai/badge/@hanweg/mcp-discord)](https://smithery.ai/server/@hanweg/mcp-discord)
-A Model Context Protocol (MCP) server that provides Discord integration capabilities to MCP clients like Claude Desktop.
+A Model Context Protocol (MCP) server that provides Discord integration capabilities to autonomous agents running on Claude Code.
 
 <a href="https://glama.ai/mcp/servers/wvwjgcnppa"><img width="380" height="200" src="https://glama.ai/mcp/servers/wvwjgcnppa/badge" alt="mcp-discord MCP server" /></a>
 
@@ -79,6 +79,38 @@ To install Discord Server for Claude Desktop automatically via [Smithery](https:
 
 ```bash
 npx -y @smithery/cli install @hanweg/mcp-discord --client claude
+```
+
+## Optional: tmux push notifications
+
+When the agent runs inside a tmux session (e.g. under `clem`), the server
+can push a one-line notification to the agent's stdin every time a new
+message lands in a watched channel. The agent then decides whether to
+fetch full content via `read_messages`.
+
+Set both env vars on the MCP server process:
+
+| Variable | Purpose |
+|----------|---------|
+| `DISCORD_WATCH_CHANNELS` | Comma-separated list of numeric channel IDs to watch |
+| `CLEM_TMUX_TARGET` | tmux session/window/pane spec (e.g. `worker:0`) |
+| `DISCORD_WATCH_DEBOUNCE` | Optional, defaults to `2.0` seconds |
+
+Notifications look like:
+
+```
+[discord] 3 new: #general(@jahwag) #tasks(@amara,@athena)
+```
+
+If either env var is missing the watcher stays disabled — existing
+deployments are unaffected.
+
+## Running tests
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e ".[test]"
+.venv/bin/pytest
 ```
 
 ## License
