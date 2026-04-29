@@ -13,6 +13,8 @@ from mcp.server import Server
 from mcp.types import Tool, TextContent
 from mcp.server.stdio import stdio_server
 
+from .watch import MessageWatcher, parse_watch_channels, tmux_inject
+
 def _configure_windows_stdout_encoding():
     if sys.platform == "win32":
         import io
@@ -42,11 +44,42 @@ app = Server("discord-server")
 # Store Discord client reference
 discord_client = None
 
+# Optional message-watcher: when DISCORD_WATCH_CHANNELS and CLEM_TMUX_TARGET
+# are both set, the gateway listener pushes one debounced notification per
+# burst into the named tmux pane. Notifications are channel + author only;
+# the agent decides whether to fetch full content via read_messages.
+_WATCH_CHANNELS = parse_watch_channels(os.getenv("DISCORD_WATCH_CHANNELS"))
+_TMUX_TARGET = os.getenv("CLEM_TMUX_TARGET", "").strip()
+_WATCH_DEBOUNCE = float(os.getenv("DISCORD_WATCH_DEBOUNCE", "2.0"))
+
+_watcher: Optional[MessageWatcher] = None
+if _WATCH_CHANNELS and _TMUX_TARGET:
+    _watcher = MessageWatcher(
+        watch_channel_ids=_WATCH_CHANNELS,
+        on_notify=lambda text: tmux_inject(_TMUX_TARGET, text),
+        debounce_seconds=_WATCH_DEBOUNCE,
+    )
+    logger.info(
+        "Message watcher armed: channels=%s tmux_target=%s debounce=%.2fs",
+        sorted(_WATCH_CHANNELS), _TMUX_TARGET, _WATCH_DEBOUNCE,
+    )
+
+
 @bot.event
 async def on_ready():
     global discord_client
     discord_client = bot
     logger.info(f"Logged in as {bot.user.name}")
+    if _watcher is not None:
+        _watcher.set_bot_user_id(bot.user.id)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if _watcher is not None:
+        await _watcher.handle_message(message)
+    # Preserve commands.Bot semantics so any future command extensions still work.
+    await bot.process_commands(message)
 
 # Helper function to ensure Discord client is ready
 def require_discord_client(func):
