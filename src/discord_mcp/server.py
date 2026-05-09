@@ -114,6 +114,38 @@ async def _download_image(url: str) -> Optional[discord.File]:
         logger.error(f"Failed to download image from {url}: {e}")
         return None
 
+
+def _load_local_image(path: str) -> Optional[discord.File]:
+    """Load a local file (or file:// URL) and return as discord.File.
+
+    The file is read into memory so the underlying handle is closed before
+    discord.py performs the upload.
+    """
+    try:
+        if path.startswith("file://"):
+            parsed = urlparse(path)
+            path = parsed.path
+        path = os.path.expanduser(path)
+        if not os.path.isabs(path):
+            raise ValueError("image_path must be absolute (or a file:// URL)")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        return discord.File(io.BytesIO(data), filename=os.path.basename(path))
+    except Exception as e:
+        logger.error(f"Failed to load local image %s: %s", path, e)
+        return None
+
+
+async def _resolve_image_attachment(arguments: dict) -> Optional[discord.File]:
+    """Resolve either image_url or image_path from arguments to a discord.File."""
+    if arguments.get("image_path"):
+        return _load_local_image(arguments["image_path"])
+    if arguments.get("image_url"):
+        return await _download_image(arguments["image_url"])
+    return None
+
 def _resolve_channel_ids(arguments: dict) -> list[str]:
     ids = arguments.get("channel_ids")
     if ids:
@@ -360,6 +392,10 @@ async def list_tools() -> List[Tool]:
                         "type": "string",
                         "description": "URL of image to attach (downloaded and sent as file)"
                     },
+                    "image_path": {
+                        "type": "string",
+                        "description": "Absolute path (or file:// URL) of a local image to attach. Takes precedence over image_url when both are set."
+                    },
                     "reply_to_message_id": {
                         "type": "string",
                         "description": "Message ID to reply to (creates a threaded reply)"
@@ -428,6 +464,10 @@ async def list_tools() -> List[Tool]:
                         "description": "Number of messages to fetch per channel (max 100)",
                         "minimum": 1,
                         "maximum": 100
+                    },
+                    "include_reaction_users": {
+                        "type": "boolean",
+                        "description": "If true, expand each reaction with the list of users who reacted. Costs one extra API call per reaction per message; off by default."
                     }
                 }
             }
@@ -552,6 +592,10 @@ async def list_tools() -> List[Tool]:
                         "type": "string",
                         "description": "URL of image to attach (downloaded and sent as file)"
                     },
+                    "image_path": {
+                        "type": "string",
+                        "description": "Absolute path (or file:// URL) of a local image to attach. Takes precedence over image_url when both are set."
+                    },
                     "reply_to_message_id": {
                         "type": "string",
                         "description": "Message ID to reply to within the thread"
@@ -619,6 +663,10 @@ async def list_tools() -> List[Tool]:
                     "image_url": {
                         "type": "string",
                         "description": "URL of image to attach to the first message"
+                    },
+                    "image_path": {
+                        "type": "string",
+                        "description": "Absolute path (or file:// URL) of a local image to attach. Takes precedence over image_url when both are set."
                     }
                 },
                 "required": ["channel_id", "name", "content"]
@@ -652,10 +700,9 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     if name == "send_message":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
         kwargs = {"content": arguments["content"]}
-        if arguments.get("image_url"):
-            file = await _download_image(arguments["image_url"])
-            if file:
-                kwargs["file"] = file
+        file = await _resolve_image_attachment(arguments)
+        if file:
+            kwargs["file"] = file
         if arguments.get("reply_to_message_id"):
             ref_msg = await channel.fetch_message(int(arguments["reply_to_message_id"]))
             kwargs["reference"] = ref_msg
@@ -686,9 +733,13 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     elif name == "read_messages":
         channel_ids = _resolve_channel_ids(arguments)
         limit = min(int(arguments.get("limit", 10)), 100)
+        include_users = bool(arguments.get("include_reaction_users", False))
 
         def format_reaction(r):
-            return f"{r['emoji']}({r['count']})"
+            base = f"{r['emoji']}({r['count']}"
+            if r.get("users"):
+                base += ": " + ", ".join(r["users"])
+            return base + ")"
 
         def format_message(m):
             lines = [f"{m['author']} ({m['timestamp']}): {m['content']}"]
@@ -717,7 +768,14 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                 reaction_data = []
                 for reaction in message.reactions:
                     emoji_str = str(reaction.emoji.name) if hasattr(reaction.emoji, 'name') and reaction.emoji.name else str(reaction.emoji.id) if hasattr(reaction.emoji, 'id') else str(reaction.emoji)
-                    reaction_data.append({"emoji": emoji_str, "count": reaction.count})
+                    entry = {"emoji": emoji_str, "count": reaction.count}
+                    if include_users:
+                        try:
+                            entry["users"] = [str(u) async for u in reaction.users()]
+                        except Exception as e:
+                            logger.warning("reaction.users() failed for %s: %s", emoji_str, e)
+                            entry["users"] = []
+                    reaction_data.append(entry)
                 attachment_data = [{
                     "filename": att.filename,
                     "url": att.url,
@@ -994,10 +1052,9 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     elif name == "send_thread_message":
         thread = await discord_client.fetch_channel(int(arguments["thread_id"]))
         kwargs = {"content": arguments["content"]}
-        if arguments.get("image_url"):
-            file = await _download_image(arguments["image_url"])
-            if file:
-                kwargs["file"] = file
+        file = await _resolve_image_attachment(arguments)
+        if file:
+            kwargs["file"] = file
         if arguments.get("reply_to_message_id"):
             ref_msg = await thread.fetch_message(int(arguments["reply_to_message_id"]))
             kwargs["reference"] = ref_msg
@@ -1030,10 +1087,9 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     elif name == "create_forum_post":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
         kwargs = {"name": arguments["name"], "content": arguments["content"]}
-        if arguments.get("image_url"):
-            file = await _download_image(arguments["image_url"])
-            if file:
-                kwargs["file"] = file
+        file = await _resolve_image_attachment(arguments)
+        if file:
+            kwargs["file"] = file
         thread_with_message = await channel.create_thread(**kwargs)
         thread = thread_with_message[0] if isinstance(thread_with_message, tuple) else thread_with_message
         return [TextContent(
