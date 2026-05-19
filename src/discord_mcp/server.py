@@ -742,7 +742,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
             return base + ")"
 
         def format_message(m):
-            lines = [f"{m['author']} ({m['timestamp']}): {m['content']}"]
+            lines = [f"{m['author']} ({m['timestamp']}) [msg_id:{m['id']}]: {m['content']}"]
             if m['attachments']:
                 att_strs = [f"{a['filename']} ({a['content_type']}, {a['url']})" for a in m['attachments']]
                 lines.append(f"Attachments: {', '.join(att_strs)}")
