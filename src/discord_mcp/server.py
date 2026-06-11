@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import io
 import asyncio
@@ -156,6 +157,32 @@ def _resolve_channel_ids(arguments: dict) -> list[str]:
     if not single:
         raise ValueError("Provide either channel_id or channel_ids")
     return [str(single)]
+
+def _history_kwargs(arguments: dict) -> dict:
+    """Translate pagination arguments into discord.py channel.history() kwargs.
+
+    discord.py defaults oldest_first to True when `after` is set, so an
+    explicit oldest_first argument always wins over that implicit flip.
+    """
+    kwargs = {}
+    if arguments.get("before_message_id"):
+        kwargs["before"] = discord.Object(id=int(arguments["before_message_id"]))
+    if arguments.get("after_message_id"):
+        kwargs["after"] = discord.Object(id=int(arguments["after_message_id"]))
+    if arguments.get("oldest_first") is not None:
+        kwargs["oldest_first"] = bool(arguments["oldest_first"])
+    return kwargs
+
+def _compile_matcher(query: str, is_regex: bool):
+    """Build a case-insensitive content matcher. Raises ValueError on a bad regex."""
+    if is_regex:
+        try:
+            pattern = re.compile(query, re.IGNORECASE)
+        except re.error as e:
+            raise ValueError(f"Invalid regex: {e}")
+        return lambda content: bool(pattern.search(content))
+    needle = query.lower()
+    return lambda content: needle in content.lower()
 
 @app.list_tools()
 async def list_tools() -> List[Tool]:
@@ -446,7 +473,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="read_messages",
-            description="Read recent messages from one or more channels. Pass either channel_id (single) or channel_ids (batch) — batched calls are fetched concurrently.",
+            description="Read messages from one or more channels. Defaults to the most recent page; use before_message_id/after_message_id (with the [msg_id:...] cursors in the output) to walk arbitrarily far back through history. Pass either channel_id (single) or channel_ids (batch) — batched calls are fetched concurrently.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -465,11 +492,73 @@ async def list_tools() -> List[Tool]:
                         "minimum": 1,
                         "maximum": 100
                     },
+                    "before_message_id": {
+                        "type": "string",
+                        "description": "Only messages older than this message ID (exclusive). Pass the oldest msg_id from the previous page to walk history backwards."
+                    },
+                    "after_message_id": {
+                        "type": "string",
+                        "description": "Only messages newer than this message ID (exclusive). Note: when set, discord.py returns oldest-first unless oldest_first is explicitly false."
+                    },
+                    "oldest_first": {
+                        "type": "boolean",
+                        "description": "Return oldest messages first. Default: false (newest first), except true when after_message_id is set."
+                    },
                     "include_reaction_users": {
                         "type": "boolean",
                         "description": "If true, expand each reaction with the list of users who reacted. Costs one extra API call per reaction per message; off by default."
                     }
                 }
+            }
+        ),
+        Tool(
+            name="search_messages",
+            description="Search a channel's or thread's history for messages matching a query, scanning page by page server-side and returning only the matches. Use for 'when did X first happen' archaeology without flooding context. Scan depth and result count are capped and any truncation is reported explicitly with a continuation cursor.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel or thread ID to search"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Case-insensitive substring to match in message content (or a Python regex if is_regex is true)"
+                    },
+                    "is_regex": {
+                        "type": "boolean",
+                        "description": "Treat query as a case-insensitive Python regex. Default false."
+                    },
+                    "author": {
+                        "type": "string",
+                        "description": "Only count messages whose author name contains this string (case-insensitive)"
+                    },
+                    "before_message_id": {
+                        "type": "string",
+                        "description": "Restrict the scan to messages older than this message ID"
+                    },
+                    "after_message_id": {
+                        "type": "string",
+                        "description": "Restrict the scan to messages newer than this message ID"
+                    },
+                    "oldest_first": {
+                        "type": "boolean",
+                        "description": "Scan from the oldest end of the range instead of the newest. Default false."
+                    },
+                    "max_scan": {
+                        "type": "number",
+                        "description": "Maximum messages to scan before stopping (default 2000, cap 20000)",
+                        "minimum": 1,
+                        "maximum": 20000
+                    },
+                    "max_results": {
+                        "type": "number",
+                        "description": "Maximum matches to return (default 25, cap 100)",
+                        "minimum": 1,
+                        "maximum": 100
+                    }
+                },
+                "required": ["channel_id", "query"]
             }
         ),
         Tool(
@@ -734,6 +823,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         channel_ids = _resolve_channel_ids(arguments)
         limit = min(int(arguments.get("limit", 10)), 100)
         include_users = bool(arguments.get("include_reaction_users", False))
+        history_kwargs = _history_kwargs(arguments)
 
         def format_reaction(r):
             base = f"{r['emoji']}({r['count']}"
@@ -764,7 +854,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                         "\n\nUse read_messages with a thread ID to read messages within a thread.")
 
             messages = []
-            async for message in channel.history(limit=limit):
+            async for message in channel.history(limit=limit, **history_kwargs):
                 reaction_data = []
                 for reaction in message.reactions:
                     emoji_str = str(reaction.emoji.name) if hasattr(reaction.emoji, 'name') and reaction.emoji.name else str(reaction.emoji.id) if hasattr(reaction.emoji, 'id') else str(reaction.emoji)
@@ -799,6 +889,74 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         results = await asyncio.gather(*[fetch_one(cid) for cid in channel_ids])
         sections = [f"=== Channel {cid} ===\n{body}" for cid, body in zip(channel_ids, results)]
         return [TextContent(type="text", text="\n\n".join(sections))]
+
+    elif name == "search_messages":
+        try:
+            matcher = _compile_matcher(arguments["query"], bool(arguments.get("is_regex", False)))
+        except ValueError as e:
+            return [TextContent(type="text", text=str(e))]
+
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        if isinstance(channel, discord.ForumChannel):
+            return [TextContent(
+                type="text",
+                text="Forum channels hold threads, not messages. Use list_threads, then search_messages on a thread ID."
+            )]
+
+        author_needle = str(arguments.get("author", "")).lower()
+        max_scan = min(int(arguments.get("max_scan", 2000)), 20000)
+        max_results = min(int(arguments.get("max_results", 25)), 100)
+        history_kwargs = _history_kwargs(arguments)
+
+        # Discord has no content-search endpoint for bot tokens, so this is a
+        # bounded client-side scan; caps and the continuation cursor below keep
+        # deep walks explicit instead of silently partial.
+        scanned = 0
+        matches = []
+        first_seen = last_seen = None  # (timestamp, id) bounds of the scanned range
+        hit_result_cap = False
+        async for message in channel.history(limit=max_scan, **history_kwargs):
+            scanned += 1
+            if first_seen is None:
+                first_seen = (message.created_at.isoformat(), str(message.id))
+            last_seen = (message.created_at.isoformat(), str(message.id))
+            if author_needle and author_needle not in str(message.author).lower():
+                continue
+            if not matcher(message.content):
+                continue
+            content = message.content
+            if len(content) > 700:
+                content = content[:700] + " [...truncated]"
+            matches.append(f"{message.author} ({message.created_at.isoformat()}) [msg_id:{message.id}]: {content}")
+            if len(matches) >= max_results:
+                hit_result_cap = True
+                break
+
+        # history() yields oldest-first when walking forward (explicit
+        # oldest_first, or an `after` bound without oldest_first=false), so the
+        # continuation cursor flips direction with the scan.
+        forward = bool(arguments.get("oldest_first")) or (
+            bool(arguments.get("after_message_id")) and arguments.get("oldest_first") is not False)
+
+        header = (f"Search {arguments['query']!r} in #{getattr(channel, 'name', channel.id)}: "
+                  f"{len(matches)} match(es), scanned {scanned} message(s)")
+        if first_seen and last_seen:
+            span = sorted([first_seen[0], last_seen[0]])
+            header += f" covering {span[0]} .. {span[1]}"
+        lines = [header + "."]
+        if last_seen:
+            cursor = (f"after_message_id={last_seen[1]}" if forward
+                      else f"before_message_id={last_seen[1]}")
+        if hit_result_cap:
+            lines.append(f"TRUNCATED: max_results={max_results} reached; continue with {cursor}.")
+        elif scanned >= max_scan:
+            lines.append(f"TRUNCATED: max_scan={max_scan} reached before exhausting history; continue with {cursor}.")
+        else:
+            lines.append("Scan exhausted the requested range; results are complete.")
+        if matches:
+            lines.append("")
+            lines.extend(matches)
+        return [TextContent(type="text", text="\n".join(lines))]
 
     elif name == "get_user_info":
         user = await discord_client.fetch_user(int(arguments["user_id"]))
