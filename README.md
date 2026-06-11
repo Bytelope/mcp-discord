@@ -16,7 +16,8 @@ A Model Context Protocol (MCP) server that provides Discord integration capabili
 
 ### Message Management
 - `send_message`: Send a message to a channel
-- `read_messages`: Read recent message history
+- `read_messages`: Read recent message history (supports `before_message_id`/`after_message_id` to walk history)
+- `search_messages`: Bounded backward scan of a channel's history for content matches
 - `add_reaction`: Add a reaction to a message
 - `add_multiple_reactions`: Add multiple reactions to a message
 - `remove_reaction`: Remove a reaction from a message
@@ -29,6 +30,33 @@ A Model Context Protocol (MCP) server that provides Discord integration capabili
 ### Role Management
 - `add_role`: Add a role to a user
 - `remove_role`: Remove a role from a user
+
+## History archaeology (finding old messages)
+
+A bot token cannot use Discord's native search (that endpoint is user-account only),
+and `read_messages` returns only the most recent N per call. To answer "when did X
+first happen" without screenshots, combine three things:
+
+1. **Snowflake date decode.** Every Discord ID encodes its creation time:
+   `timestamp_ms = (id >> 22) + 1420070400000`. To jump to a date instead of
+   paging from now, build a synthetic cursor:
+   `before_id = (target_unix_ms - 1420070400000) << 22`, then call
+   `read_messages` with `before_message_id=before_id`. The first page lands at
+   roughly that date.
+
+2. **Paginate backwards.** When a `read_messages` page is full it prints
+   `pass before_message_id=<oldest_id> to continue back`. Feed that id into the
+   next call to walk arbitrarily far back, one page (API round-trip) at a time.
+
+3. **Search a window.** `search_messages` paginates backwards for you and filters
+   content client-side. It is a *bounded* scan: it stops at `max_pages`
+   (default 10 x 100 messages) and says so loudly, so a "no match" on a truncated
+   scan is never mistaken for "does not exist". To go deeper, raise `max_pages` or
+   pass the `before_message_id` it reports back to resume.
+
+Example: to find the earliest "Clementine" mention, snowflake-jump near the
+channel's creation date, then `search_messages` forward in windows, or page
+`read_messages` backward until the channel start (an under-full page).
 
 ## Installation
 

@@ -10,13 +10,11 @@ from discord_mcp import server  # noqa: E402
 
 
 def _build_format_reaction(include_users: bool):
-    """Recreate the inner closure logic exposed via the read_messages handler."""
-    def format_reaction(r):
-        base = f"{r['emoji']}({r['count']}"
-        if r.get("users"):
-            base += ": " + ", ".join(r["users"])
-        return base + ")"
-    return format_reaction
+    """Exercise the real module-level reaction formatter used by read_messages.
+
+    The formatter renders whatever dict it is handed, so we return the live
+    function directly instead of a local copy that would silently drift."""
+    return server._format_reaction
 
 
 class TestFormatReactionSerialization:
