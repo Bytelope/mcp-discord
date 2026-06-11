@@ -1,6 +1,6 @@
 [project]
 name = "mcp-discord"
-version = "0.1.0"
+version = "0.2.0"
 description = "Discord integration for Model Context Protocol"
 authors = [
     {name = "Hanweg Altimer", email = "hanwegaltimer@outlook.com"},

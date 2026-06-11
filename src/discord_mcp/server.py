@@ -157,6 +157,58 @@ def _resolve_channel_ids(arguments: dict) -> list[str]:
         raise ValueError("Provide either channel_id or channel_ids")
     return [str(single)]
 
+
+def _format_reaction(r: dict) -> str:
+    base = f"{r['emoji']}({r['count']}"
+    if r.get("users"):
+        base += ": " + ", ".join(r["users"])
+    return base + ")"
+
+
+def _format_message(m: dict) -> str:
+    lines = [f"{m['author']} ({m['timestamp']}) [msg_id:{m['id']}]: {m['content']}"]
+    if m['attachments']:
+        att_strs = [f"{a['filename']} ({a['content_type']}, {a['url']})" for a in m['attachments']]
+        lines.append(f"Attachments: {', '.join(att_strs)}")
+    lines.append(
+        "Reactions: " + (", ".join(_format_reaction(r) for r in m['reactions']) if m['reactions'] else "No reactions")
+    )
+    return "\n".join(lines)
+
+
+async def _serialize_message(message, include_users: bool) -> dict:
+    """Serialize a discord.Message into the dict shape used by read/search output."""
+    reaction_data = []
+    for reaction in message.reactions:
+        emoji_str = (
+            str(reaction.emoji.name) if hasattr(reaction.emoji, 'name') and reaction.emoji.name
+            else str(reaction.emoji.id) if hasattr(reaction.emoji, 'id')
+            else str(reaction.emoji)
+        )
+        entry = {"emoji": emoji_str, "count": reaction.count}
+        if include_users:
+            try:
+                entry["users"] = [str(u) async for u in reaction.users()]
+            except Exception as e:
+                logger.warning("reaction.users() failed for %s: %s", emoji_str, e)
+                entry["users"] = []
+        reaction_data.append(entry)
+    attachment_data = [{
+        "filename": att.filename,
+        "url": att.url,
+        "content_type": att.content_type,
+        "size": att.size,
+    } for att in message.attachments]
+    return {
+        "id": str(message.id),
+        "author": str(message.author),
+        "content": message.content,
+        "timestamp": message.created_at.isoformat(),
+        "reactions": reaction_data,
+        "attachments": attachment_data,
+    }
+
+
 @app.list_tools()
 async def list_tools() -> List[Tool]:
     """List available Discord tools."""
@@ -446,7 +498,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="read_messages",
-            description="Read recent messages from one or more channels. Pass either channel_id (single) or channel_ids (batch) — batched calls are fetched concurrently.",
+            description="Read recent messages from one or more channels. Pass either channel_id (single) or channel_ids (batch); batched calls are fetched concurrently. To walk history backwards (archaeology), pass before_message_id set to the oldest msg_id of the previous page and repeat; each page costs one API round-trip per channel.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -465,11 +517,69 @@ async def list_tools() -> List[Tool]:
                         "minimum": 1,
                         "maximum": 100
                     },
+                    "before_message_id": {
+                        "type": "string",
+                        "description": "Only return messages older than this message ID (newest-first). Use the oldest msg_id from the previous page to walk arbitrarily far back. Applies to every channel in a batch."
+                    },
+                    "after_message_id": {
+                        "type": "string",
+                        "description": "Only return messages newer than this message ID. Without an explicit oldest_first, setting this returns oldest-first (Discord default for `after`)."
+                    },
+                    "oldest_first": {
+                        "type": "boolean",
+                        "description": "Force ordering: true = oldest-first, false = newest-first. Overrides the implicit oldest-first that Discord applies when after_message_id is set. Omit to keep default behaviour."
+                    },
                     "include_reaction_users": {
                         "type": "boolean",
                         "description": "If true, expand each reaction with the list of users who reacted. Costs one extra API call per reaction per message; off by default."
                     }
                 }
+            }
+        ),
+        Tool(
+            name="search_messages",
+            description=(
+                "Search a channel's history for messages whose content matches a query. "
+                "Discord's native search endpoint is user-account only, so a bot cannot use it; "
+                "this paginates the channel history backwards and filters client-side. It is a "
+                "BOUNDED scan: it stops after max_pages (default 10 x 100 = up to 1000 messages) and "
+                "reports clearly when it stopped early, so a 'no matches' result on a truncated scan is "
+                "never mistaken for 'does not exist'. Deep walks cost one API round-trip per page; widen "
+                "max_pages only when needed and prefer a before_message_id cursor to resume."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Discord channel ID to search"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Case-insensitive substring matched against message content"
+                    },
+                    "author": {
+                        "type": "string",
+                        "description": "Optional: only match messages from this author (username or numeric user ID)"
+                    },
+                    "max_matches": {
+                        "type": "number",
+                        "description": "Stop once this many matches are found (default 25)",
+                        "minimum": 1,
+                        "maximum": 100
+                    },
+                    "max_pages": {
+                        "type": "number",
+                        "description": "Maximum 100-message pages to scan before stopping (default 10, max 50). Higher = deeper but more API calls.",
+                        "minimum": 1,
+                        "maximum": 50
+                    },
+                    "before_message_id": {
+                        "type": "string",
+                        "description": "Optional cursor: start the backward scan from messages older than this ID (resume a previous search)."
+                    }
+                },
+                "required": ["channel_id", "query"]
             }
         ),
         Tool(
@@ -734,20 +844,24 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         channel_ids = _resolve_channel_ids(arguments)
         limit = min(int(arguments.get("limit", 10)), 100)
         include_users = bool(arguments.get("include_reaction_users", False))
-
-        def format_reaction(r):
-            base = f"{r['emoji']}({r['count']}"
-            if r.get("users"):
-                base += ": " + ", ".join(r["users"])
-            return base + ")"
-
-        def format_message(m):
-            lines = [f"{m['author']} ({m['timestamp']}) [msg_id:{m['id']}]: {m['content']}"]
-            if m['attachments']:
-                att_strs = [f"{a['filename']} ({a['content_type']}, {a['url']})" for a in m['attachments']]
-                lines.append(f"Attachments: {', '.join(att_strs)}")
-            lines.append(f"Reactions: {', '.join([format_reaction(r) for r in m['reactions']]) if m['reactions'] else 'No reactions'}")
-            return "\n".join(lines)
+        before_id = arguments.get("before_message_id")
+        after_id = arguments.get("after_message_id")
+        history_kwargs = {"limit": limit}
+        try:
+            if before_id:
+                history_kwargs["before"] = discord.Object(id=int(before_id))
+            if after_id:
+                history_kwargs["after"] = discord.Object(id=int(after_id))
+        except (ValueError, TypeError):
+            return [TextContent(type="text", text="before_message_id/after_message_id must be numeric Discord message IDs.")]
+        explicit_oldest = arguments.get("oldest_first")
+        if explicit_oldest is not None:
+            # discord.py implicitly flips oldest_first=True when `after` is set;
+            # an explicit value always wins over that implicit flip.
+            history_kwargs["oldest_first"] = bool(explicit_oldest)
+        # Effective ordering: explicit flag wins, else discord.py returns
+        # oldest-first only when `after` is set without `before`.
+        ascending = bool(explicit_oldest) if explicit_oldest is not None else (bool(after_id) and not before_id)
 
         async def fetch_one(cid: str) -> str:
             try:
@@ -763,35 +877,23 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                 return (f"Forum channel has {len(threads)} active threads:\n" + "\n".join(thread_list) +
                         "\n\nUse read_messages with a thread ID to read messages within a thread.")
 
-            messages = []
-            async for message in channel.history(limit=limit):
-                reaction_data = []
-                for reaction in message.reactions:
-                    emoji_str = str(reaction.emoji.name) if hasattr(reaction.emoji, 'name') and reaction.emoji.name else str(reaction.emoji.id) if hasattr(reaction.emoji, 'id') else str(reaction.emoji)
-                    entry = {"emoji": emoji_str, "count": reaction.count}
-                    if include_users:
-                        try:
-                            entry["users"] = [str(u) async for u in reaction.users()]
-                        except Exception as e:
-                            logger.warning("reaction.users() failed for %s: %s", emoji_str, e)
-                            entry["users"] = []
-                    reaction_data.append(entry)
-                attachment_data = [{
-                    "filename": att.filename,
-                    "url": att.url,
-                    "content_type": att.content_type,
-                    "size": att.size,
-                } for att in message.attachments]
-                messages.append({
-                    "id": str(message.id),
-                    "author": str(message.author),
-                    "content": message.content,
-                    "timestamp": message.created_at.isoformat(),
-                    "reactions": reaction_data,
-                    "attachments": attachment_data,
-                })
-            return (f"Retrieved {len(messages)} messages:\n\n" +
-                    "\n".join([format_message(m) for m in messages]))
+            messages = [await _serialize_message(m, include_users)
+                        async for m in channel.history(**history_kwargs)]
+            header = f"Retrieved {len(messages)} messages"
+            if before_id:
+                header += f" before {before_id}"
+            if after_id:
+                header += f" after {after_id}"
+            if messages and len(messages) == limit:
+                # A full page may have more beyond it. The continuation cursor
+                # depends on result order: ascending pages walk forward (newer),
+                # descending pages walk backward (older). messages[-1] is the
+                # last message in display order in both cases.
+                if ascending:
+                    header += f" (page full; pass after_message_id={messages[-1]['id']} to continue forward)"
+                else:
+                    header += f" (page full; pass before_message_id={messages[-1]['id']} to continue back)"
+            return header + ":\n\n" + "\n".join(_format_message(m) for m in messages)
 
         if len(channel_ids) == 1:
             return [TextContent(type="text", text=await fetch_one(channel_ids[0]))]
@@ -799,6 +901,80 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         results = await asyncio.gather(*[fetch_one(cid) for cid in channel_ids])
         sections = [f"=== Channel {cid} ===\n{body}" for cid, body in zip(channel_ids, results)]
         return [TextContent(type="text", text="\n\n".join(sections))]
+
+    elif name == "search_messages":
+        channel_id = arguments["channel_id"]
+        query = str(arguments["query"]).lower()
+        author_filter = arguments.get("author")
+        author_filter = str(author_filter) if author_filter else None
+        cursor = arguments.get("before_message_id")
+        try:
+            max_matches = max(1, min(int(arguments.get("max_matches", 25)), 100))
+            max_pages = max(1, min(int(arguments.get("max_pages", 10)), 50))
+            if cursor is not None:
+                int(cursor)  # validate now so the scan loop never crashes mid-walk
+        except (ValueError, TypeError):
+            return [TextContent(type="text", text="max_matches/max_pages must be integers and before_message_id must be a numeric Discord message ID.")]
+
+        try:
+            channel = await discord_client.fetch_channel(int(channel_id))
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error fetching channel {channel_id}: {e}")]
+
+        def author_matches(message) -> bool:
+            if not author_filter:
+                return True
+            return author_filter in (str(message.author), str(message.author.id), message.author.name)
+
+        matches = []
+        scanned = 0
+        pages = 0
+        oldest_id = None
+        oldest_ts = None
+        truncated = False
+
+        while pages < max_pages and len(matches) < max_matches:
+            kwargs = {"limit": 100}
+            if cursor:
+                kwargs["before"] = discord.Object(id=int(cursor))
+            page = [m async for m in channel.history(**kwargs)]
+            if not page:
+                break  # reached the start of the channel
+            pages += 1
+            scanned += len(page)
+            oldest_id = str(page[-1].id)
+            oldest_ts = page[-1].created_at.isoformat()
+            cursor = oldest_id
+            for message in page:
+                if query in message.content.lower() and author_matches(message):
+                    matches.append(await _serialize_message(message, include_users=False))
+                    if len(matches) >= max_matches:
+                        break
+            if len(page) < 100:
+                break  # last page in channel; nothing older exists
+        else:
+            # loop exited on max_pages or max_matches without hitting channel start
+            truncated = True
+        hit_match_cap = len(matches) >= max_matches
+        if hit_match_cap:
+            truncated = True
+        # Resume losslessly: if we stopped on the match cap mid-page, the oldest
+        # message we have fully accounted for is the last match (older messages in
+        # that same page were not checked). Otherwise it is the oldest scanned id.
+        resume_id = matches[-1]['id'] if (hit_match_cap and matches) else oldest_id
+
+        header = (f"search_messages: scanned {scanned} messages across {pages} page(s) of "
+                  f"channel {channel_id}; {len(matches)} match(es) for query "
+                  f"\"{arguments['query']}\"" + (f" by author {author_filter}" if author_filter else "") + ".")
+        if truncated:
+            header += (f"\nSCAN TRUNCATED (stopped at max_pages={max_pages} or max_matches={max_matches}); "
+                       f"older messages were NOT searched. A 'no match' here does not prove the message does "
+                       f"not exist. Resume deeper with before_message_id={resume_id}"
+                       + (f" (oldest scanned: {oldest_ts})" if oldest_ts else "") + ".")
+        else:
+            header += "\nScan reached the start of the channel; this result is exhaustive."
+        body = "\n".join(_format_message(m) for m in matches) if matches else "(no matching messages)"
+        return [TextContent(type="text", text=header + "\n\n" + body)]
 
     elif name == "get_user_info":
         user = await discord_client.fetch_user(int(arguments["user_id"]))
