@@ -41,3 +41,28 @@ class TestServerHelpersWired:
 
     def test_load_local_image_callable(self):
         assert callable(server._load_local_image)
+
+
+
+class TestCompactFormat:
+    def _msg(self, **over):
+        m = {"id": "1", "author": "a", "content": "hi",
+             "timestamp": "2026-06-12T20:24:06.609000+00:00",
+             "reactions": [], "attachments": []}
+        m.update(over)
+        return m
+
+    def test_compact_omits_empty_reactions_and_trims_timestamp(self):
+        out = server._format_message(self._msg())
+        assert "No reactions" not in out
+        assert "(2026-06-12T20:24)" in out
+
+    def test_compact_keeps_real_reactions(self):
+        out = server._format_message(self._msg(reactions=[{"emoji": "x", "count": 2}]))
+        assert "Reactions: x(2)" in out
+
+    def test_non_compact_restores_legacy_format(self, monkeypatch):
+        monkeypatch.setattr(server, "_COMPACT", False)
+        out = server._format_message(self._msg())
+        assert "Reactions: No reactions" in out
+        assert "(2026-06-12T20:24:06.609000+00:00)" in out

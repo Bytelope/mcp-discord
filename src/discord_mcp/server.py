@@ -52,6 +52,12 @@ _WATCH_CHANNELS = parse_watch_channels(os.getenv("DISCORD_WATCH_CHANNELS"))
 _TMUX_TARGET = os.getenv("CLEM_TMUX_TARGET", "").strip()
 _WATCH_DEBOUNCE = float(os.getenv("DISCORD_WATCH_DEBOUNCE", "2.0"))
 
+# Compact output (default ON; opt out with DISCORD_COMPACT=0): trims the
+# per-message format for agent consumers -- "Reactions:" line only when
+# reactions exist, timestamps to minute precision. Measured on a production
+# agent team: channel dumps were the single largest variable token cost.
+_COMPACT = os.getenv("DISCORD_COMPACT", "1").strip().lower() not in ("0", "false", "no", "off")
+
 _watcher: Optional[MessageWatcher] = None
 if _WATCH_CHANNELS and _TMUX_TARGET:
     _watcher = MessageWatcher(
@@ -166,13 +172,15 @@ def _format_reaction(r: dict) -> str:
 
 
 def _format_message(m: dict) -> str:
-    lines = [f"{m['author']} ({m['timestamp']}) [msg_id:{m['id']}]: {m['content']}"]
+    ts = m['timestamp'][:16] if _COMPACT else m['timestamp']
+    lines = [f"{m['author']} ({ts}) [msg_id:{m['id']}]: {m['content']}"]
     if m['attachments']:
         att_strs = [f"{a['filename']} ({a['content_type']}, {a['url']})" for a in m['attachments']]
         lines.append(f"Attachments: {', '.join(att_strs)}")
-    lines.append(
-        "Reactions: " + (", ".join(_format_reaction(r) for r in m['reactions']) if m['reactions'] else "No reactions")
-    )
+    if m['reactions']:
+        lines.append("Reactions: " + ", ".join(_format_reaction(r) for r in m['reactions']))
+    elif not _COMPACT:
+        lines.append("Reactions: No reactions")
     return "\n".join(lines)
 
 
@@ -680,6 +688,14 @@ async def list_tools() -> List[Tool]:
                     "include_archived": {
                         "type": "boolean",
                         "description": "Include archived threads (default: false)"
+                    },
+                    "name_contains": {
+                        "type": "string",
+                        "description": "Only return threads whose name contains this substring (case-insensitive). Use to fetch e.g. only [TODO] threads from a large task board instead of the full listing."
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum threads to return per channel after filtering (default: all). A note reports how many were omitted."
                     }
                 }
             }
@@ -1194,6 +1210,13 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     elif name == "list_threads":
         channel_ids = _resolve_channel_ids(arguments)
         include_archived = arguments.get("include_archived", False)
+        name_contains = str(arguments.get("name_contains", "") or "").lower()
+        try:
+            max_threads = int(arguments["limit"]) if arguments.get("limit") is not None else None
+            if max_threads is not None and max_threads < 1:
+                raise ValueError
+        except (ValueError, TypeError):
+            return [TextContent(type="text", text="limit must be a positive integer.")]
 
         async def list_one(cid: str) -> str:
             try:
@@ -1209,14 +1232,27 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                 except Exception:
                     pass
             all_threads = active + archived
+            if name_contains:
+                all_threads = [t for t in all_threads if name_contains in t.name.lower()]
             if not all_threads:
-                return "No active threads in this channel."
+                return ("No matching threads in this channel." if name_contains
+                        else "No active threads in this channel.")
+            omitted = 0
+            if max_threads is not None and len(all_threads) > max_threads:
+                omitted = len(all_threads) - max_threads
+                all_threads = all_threads[:max_threads]
             thread_list = []
             for t in all_threads:
                 prefix = "[archived] " if t.archived else ""
                 thread_list.append(f"{prefix}#{t.name} (ID: {t.id}, messages: {t.message_count})")
-            return (f"Threads ({len(active)} active"
-                    f"{f', {len(archived)} archived' if archived else ''}):\n" + "\n".join(thread_list))
+            header = f"Threads ({len(active)} active"
+            header += f", {len(archived)} archived" if archived else ""
+            header += f", filter: {name_contains!r}" if name_contains else ""
+            header += "):"
+            body = header + "\n" + "\n".join(thread_list)
+            if omitted:
+                body += f"\n({omitted} more threads omitted by limit; raise limit or narrow name_contains)"
+            return body
 
         if len(channel_ids) == 1:
             return [TextContent(type="text", text=await list_one(channel_ids[0]))]
