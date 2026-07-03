@@ -687,11 +687,11 @@ async def list_tools() -> List[Tool]:
                     },
                     "include_archived": {
                         "type": "boolean",
-                        "description": "Include archived threads (default: false)"
+                        "description": "Include archived threads (default: false; capped at the 50 most recently archived)"
                     },
                     "name_contains": {
                         "type": "string",
-                        "description": "Only return threads whose name contains this substring (case-insensitive). Use to fetch e.g. only [TODO] threads from a large task board instead of the full listing."
+                        "description": "Only return threads whose name contains this substring (case-insensitive). Scans active AND the FULL archive (no 50 cap), so old threads far down the board are never missed. Preferred way to fetch e.g. [TODO] threads from a large task board."
                     },
                     "limit": {
                         "type": "number",
@@ -1225,9 +1225,12 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                 return f"Error fetching channel {cid}: {e}"
             active = list(channel.threads)
             archived = []
-            if include_archived:
+            if include_archived or name_contains:
                 try:
-                    async for t in channel.archived_threads(limit=50):
+                    # name filter scans the FULL archive so old threads can't
+                    # be missed; bare include_archived keeps the 50-newest cap
+                    # to bound output size
+                    async for t in channel.archived_threads(limit=None if name_contains else 50):
                         archived.append(t)
                 except Exception:
                     pass
