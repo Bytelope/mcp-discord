@@ -105,13 +105,29 @@ class MessageWatcher:
         self.bot_user_id = uid
 
     async def handle_message(self, message: discord.Message) -> None:
-        # Only filter self-echoes — keeping cross-bot chatter visible is the
-        # whole point (Amara→Athena coordination, helper bots, etc.). The
-        # generic "any bot" filter was too aggressive and dropped legitimate
-        # notifications from other automated sources.
+        # Filter self-echoes only, not "any bot" — cross-bot chatter must stay
+        # visible (Amara→Athena coordination, helper bots, etc.).
         if self.bot_user_id is not None and message.author.id == self.bot_user_id:
             return
-        if str(message.channel.id) not in self.watch:
+        # Thread messages (forum posts in #tasks, threaded replies anywhere)
+        # carry the thread's ID in channel.id — match the parent channel too,
+        # or watched forum channels never notify.
+        ids = {str(message.channel.id)}
+        parent_id = getattr(message.channel, "parent_id", None)
+        if parent_id:
+            ids.add(str(parent_id))
+        if not (ids & self.watch):
+            return
+        # A message that explicitly @-mentions users but not this bot is
+        # directed at someone else — don't wake this agent. Untagged messages,
+        # @everyone, and role pings still notify everyone so cross-agent
+        # coordination stays visible.
+        mentions = getattr(message, "mentions", None) or []
+        if (mentions
+                and self.bot_user_id is not None
+                and not getattr(message, "mention_everyone", False)
+                and not getattr(message, "role_mentions", None)
+                and self.bot_user_id not in {u.id for u in mentions}):
             return
         channel_name = getattr(message.channel, "name", str(message.channel.id))
         async with self._lock:

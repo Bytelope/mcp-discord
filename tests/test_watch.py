@@ -124,12 +124,18 @@ class TestTmuxInject:
 
 def _fake_message(channel_id: str, author_name: str = "jahwag",
                   author_id: int = 100, is_bot: bool = False,
-                  channel_name: str = "general"):
+                  channel_name: str = "general", parent_id=None,
+                  mention_ids=(), mention_everyone: bool = False,
+                  role_mentions=()):
     """Build a duck-typed object that quacks like discord.Message for handle_message."""
     return types.SimpleNamespace(
-        channel=types.SimpleNamespace(id=channel_id, name=channel_name),
+        channel=types.SimpleNamespace(
+            id=channel_id, name=channel_name, parent_id=parent_id),
         author=types.SimpleNamespace(
             id=author_id, name=author_name, bot=is_bot),
+        mentions=[types.SimpleNamespace(id=i) for i in mention_ids],
+        mention_everyone=mention_everyone,
+        role_mentions=list(role_mentions),
     )
 
 
@@ -169,6 +175,66 @@ class TestMessageWatcher:
         await watcher.handle_message(_fake_message("999"))
         await asyncio.sleep(0.1)
         assert collector == []
+
+    async def test_thread_in_watched_forum_matches_parent(
+            self, watcher, collector):
+        # Forum posts (#tasks) arrive with channel.id = thread ID; the parent
+        # forum channel being watched must be enough.
+        await watcher.handle_message(
+            _fake_message("555", channel_name="fix-the-scraper",
+                          parent_id="100"))
+        await asyncio.sleep(0.1)
+        assert len(collector) == 1
+        assert "#fix-the-scraper" in collector[0]
+
+    async def test_thread_with_unwatched_parent_filtered(
+            self, watcher, collector):
+        await watcher.handle_message(
+            _fake_message("555", parent_id="999"))
+        await asyncio.sleep(0.1)
+        assert collector == []
+
+    async def test_mention_of_other_user_filtered(self, watcher, collector):
+        watcher.set_bot_user_id(999)
+        await watcher.handle_message(
+            _fake_message("100", mention_ids=(42,)))  # @amara, not us
+        await asyncio.sleep(0.1)
+        assert collector == []
+
+    async def test_mention_of_self_passes(self, watcher, collector):
+        watcher.set_bot_user_id(999)
+        await watcher.handle_message(
+            _fake_message("100", mention_ids=(42, 999)))
+        await asyncio.sleep(0.1)
+        assert len(collector) == 1
+
+    async def test_unmentioned_message_passes(self, watcher, collector):
+        watcher.set_bot_user_id(999)
+        await watcher.handle_message(_fake_message("100"))
+        await asyncio.sleep(0.1)
+        assert len(collector) == 1
+
+    async def test_mention_everyone_passes(self, watcher, collector):
+        watcher.set_bot_user_id(999)
+        await watcher.handle_message(
+            _fake_message("100", mention_ids=(42,), mention_everyone=True))
+        await asyncio.sleep(0.1)
+        assert len(collector) == 1
+
+    async def test_role_mention_passes(self, watcher, collector):
+        watcher.set_bot_user_id(999)
+        await watcher.handle_message(
+            _fake_message("100", mention_ids=(42,),
+                          role_mentions=("agents",)))
+        await asyncio.sleep(0.1)
+        assert len(collector) == 1
+
+    async def test_mention_filter_inactive_without_bot_id(
+            self, watcher, collector):
+        # bot_user_id unknown (gateway not ready yet) → never drop pings.
+        await watcher.handle_message(_fake_message("100", mention_ids=(42,)))
+        await asyncio.sleep(0.1)
+        assert len(collector) == 1
 
     async def test_emits_after_debounce(self, watcher, collector):
         await watcher.handle_message(_fake_message("100"))
